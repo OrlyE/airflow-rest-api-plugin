@@ -21,6 +21,11 @@ import socket
 from flask_appbuilder import expose as app_builder_expose, BaseView as AppBuilderBaseView,has_access
 from flask_jwt_extended.view_decorators import jwt_required, verify_jwt_in_request
 
+import pytz
+from airflow import settings
+from airflow.models import DagModel, DagRun, TaskInstance, DagBag
+from sqlalchemy.sql.functions import max
+from airflow.utils.state import State
 
 
 """
@@ -439,6 +444,19 @@ apis_metadata = [
         ],
     },
     {
+        "name": "clear_last_runs",
+        "description": "Clear n last set of task instance, as if they never ran",
+        "airflow_version": "0.1 or greater",
+        "http_method": ["GET", "POST"],
+        "arguments": [
+            {"name": "dag_id", "description": "The id of the dag", "form_input_type": "text", "required": True},
+            {"name": "run_number", "description": "number of runs to clear", "form_input_type": "text", "required": True}
+        ],
+        "fixed_arguments": [
+            {"name": "no_confirm", "description": "Do not request confirmation", "fixed_value": ""}
+        ],
+    },
+    {
         "name": "deploy_dag",
         "description": "Deploy a new DAG File to the DAGs directory",
         "airflow_version": "None - Custom API",
@@ -701,6 +719,8 @@ class REST_API(get_baseview()):
             final_response = self.refresh_dag(base_response)
         elif api == "refresh_all_dags":
             final_response = self.refresh_all_dags(base_response)
+        elif api == "clear_last_runs":
+            final_response = self.clear_last_runs(base_response)
         else:
             final_response = self.execute_cli(base_response, api_metadata)
 
@@ -903,6 +923,82 @@ class REST_API(get_baseview()):
             return REST_API_Response_Util.get_500_error_response(base_response, error_message)
 
         return REST_API_Response_Util.get_200_response(base_response=base_response, output="All DAGs are now up to date")
+
+    # Custom Function for the clear API
+    def clear_last_runs(self, base_response):
+        logging.info("Executing custom 'clear_dag' function")
+        in_dag_id = request.args.get('dag_id')
+        run_number = request.args.get('run_number')
+        dag_id = None
+        dag = None
+        logging.info("Clear {} last runs for dag id: {}".format(run_number, in_dag_id))
+        try:
+            session = settings.Session()
+            dag_bag = self.get_dagbag()
+
+            for dag in dag_bag.dags:
+                if dag in in_dag_id:
+                    dag_id = dag_bag.dags[dag].dag_id
+                    dag = dag_bag.dags[dag]
+                    break
+
+            if not dag_id:
+                raise Exception("Dag id {} does'nt exists".format(in_dag_id))
+
+            dag_last_n_runs = session.query(DagRun.execution_date).filter(DagRun.dag_id == dag_id).order_by(
+                DagRun.execution_date.desc()).limit(run_number)
+            all_n_runs_tasks = session.query(TaskInstance).filter(TaskInstance.dag_id == dag_id,
+                                                                  TaskInstance.execution_date.in_(dag_last_n_runs))
+            tis = all_n_runs_tasks
+            all_tis = tis.all()
+            for ti in tis:
+                ti_downstream_tasks = session.query(TaskInstance).filter(TaskInstance.dag_id == ti.dag_id,
+                                                                         TaskInstance.execution_date == ti.execution_date,
+                                                                         TaskInstance.priority_weight < ti.priority_weight)
+                all_tis.extend(ti_downstream_tasks)
+            job_ids = []
+            for ti in all_tis:
+                if ti.state == State.RUNNING:
+                    if ti.job_id:
+                        ti.state = State.SHUTDOWN
+                        job_ids.append(ti.job_id)
+                else:
+                    task_id = ti.task_id
+                    if dag and dag.has_task(task_id):
+                        task = dag.get_task(task_id)
+                        task_retries = task.retries
+                        ti.max_tries = ti.try_number + task_retries - 1
+                    else:
+                        # Ignore errors when updating max_tries if dag is None or
+                        # task not found in dag since database records could be
+                        # outdated. We make max_tries the maximum value of its
+                        # original max_tries or the current task try number.
+                        ti.max_tries = max(ti.max_tries, ti.try_number - 1)
+                    ti.state = State.NONE
+                    session.merge(ti)
+
+            if job_ids:
+                from airflow.jobs import BaseJob as BJ
+
+                for job in session.query(BJ).filter(BJ.id.in_(job_ids)).all():
+                    job.state = State.SHUTDOWN
+
+            if tis:
+                drs = session.query(DagRun).filter(
+                    DagRun.dag_id.in_({ti.dag_id for ti in tis}),
+                    DagRun.execution_date.in_({ti.execution_date for ti in tis}),
+                ).all()
+                for dr in drs:
+                    dr.state = State.RUNNING
+                    dr.start_date = datetime.utcnow().replace(tzinfo=pytz.utc)
+                session.query(DagModel).filter(DagModel.dag_id == dag_id).first().is_paused = False
+            session.commit()
+            return REST_API_Response_Util.get_200_response(base_response=base_response,
+                                                           output="Dag cleared.")
+        except Exception as e:
+            error_message = "An error occurred while trying to Refresh all the DAGs: " + str(e)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_500_error_response(base_response, error_message)
 
     # Executes the airflow command passed into it in the background so the function isn't tied to the webserver process
     @staticmethod
