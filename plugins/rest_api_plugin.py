@@ -926,9 +926,13 @@ class REST_API(get_baseview()):
 
     # Custom Function for the clear API
     def clear_last_runs(self, base_response):
-        logging.info("Executing custom 'clear_dag' function")
+        logging.info("Executing custom 'clear_last_runs' function")
         in_dag_id = request.args.get('dag_id')
         run_number = request.args.get('run_number')
+
+        if not run_number.isdigit():
+            raise Exception("Incorrect input: run_number, expecting digit and received {}".format(type(run_number)))
+
         dag_id = None
         dag = None
         logging.info("Clear {} last runs for dag id: {}".format(run_number, in_dag_id))
@@ -937,7 +941,7 @@ class REST_API(get_baseview()):
             dag_bag = self.get_dagbag()
 
             for dag in dag_bag.dags:
-                if dag in in_dag_id:
+                if in_dag_id == dag:
                     dag_id = dag_bag.dags[dag].dag_id
                     dag = dag_bag.dags[dag]
                     break
@@ -996,7 +1000,7 @@ class REST_API(get_baseview()):
             return REST_API_Response_Util.get_200_response(base_response=base_response,
                                                            output="Dag cleared.")
         except Exception as e:
-            error_message = "An error occurred while trying to Refresh all the DAGs: " + str(e)
+            error_message = "An error occurred while trying to Clear last runs: " + str(e)
             logging.error(error_message)
             return REST_API_Response_Util.get_500_error_response(base_response, error_message)
 
